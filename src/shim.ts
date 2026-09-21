@@ -15,6 +15,8 @@ import { Readable } from 'node:stream'
 import { LiveMiniMaxStore, MiniMaxAuthError, type MiniMaxRegion } from './auth.ts'
 import { MiniMaxCatalog } from './catalog.ts'
 import { MiniMaxUpstreamClient, type UpstreamErrorKind } from './upstream.ts'
+import { MINIMAX_CONNECT_VERSION } from './version.ts'
+import { redactPaths } from './redact.ts'
 
 export interface ShimLogger {
   info(...args: unknown[]): void
@@ -86,8 +88,9 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 function writeError(res: ServerResponse, status: number, kind: string, message: string): void {
-  // 错误体也用 Anthropic 风格，方便 SDK 解析
-  writeJson(res, status, { type: 'error', error: { type: kind, message } })
+  // 错误体也用 Anthropic 风格，方便 SDK 解析；
+  // 消息统一脱敏本机路径，避免日志/界面泄露真实用户名与目录。
+  writeJson(res, status, { type: 'error', error: { type: kind, message: redactPaths(message) } })
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -172,7 +175,7 @@ export function createMiniMaxShim(options: MiniMaxShimOptions): MiniMaxShim {
       const url = req.url ?? '/'
 
       if (req.method === 'GET' && (url === '/healthz' || url === '/healthz/')) {
-        return writeJson(res, 200, { ok: true, region })
+        writeJson(res, 200, { ok: true, region, version: MINIMAX_CONNECT_VERSION })
       }
       if (req.method === 'GET' && (url === '/status' || url === '/status/')) {
         return await status(req, res)

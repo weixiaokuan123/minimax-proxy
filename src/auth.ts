@@ -153,6 +153,15 @@ export class LiveMiniMaxStore {
     }
   }
 
+  /**
+   * 轻量判断：该区域是否存在任何 OAuth 记录（不校验有效期、不抛错、不碰进程）。
+   * 用于在「自动拉起桌面端」前先排除「从未登录此区域」的情况，避免无谓启动程序。
+   */
+  async hasCredential(): Promise<boolean> {
+    const { record } = await this.readRecord()
+    return record !== undefined
+  }
+
   async status(): Promise<AuthStatus> {
     const hint = await readAccountHint(this.region)
     try {
