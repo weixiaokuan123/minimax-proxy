@@ -180,7 +180,7 @@ export function createMiniMaxShim(options: MiniMaxShimOptions): MiniMaxShim {
       if (req.method === 'GET' && (url === '/status' || url === '/status/')) {
         return await status(req, res)
       }
-      if (req.method === 'GET' && (url === '/v1/models' || url === '/v1/models/')) {
+      if (req.method === 'GET' && (url === '/v1/models' || url === '/v1/models/' || url === '/models' || url === '/models/')) {
         return listModels(res)
       }
 
@@ -206,8 +206,9 @@ export function createMiniMaxShim(options: MiniMaxShimOptions): MiniMaxShim {
         }
       }
 
-      // Anthropic Messages：/v1/messages 与 /v1/messages/count_tokens
-      const messagesMatch = /^\/v1\/messages(\/count_tokens)?\/?$/.exec(url.split('?')[0] ?? '')
+      // Anthropic Messages：兼容 /v1/messages 与 /messages（@ai-sdk/anthropic
+      // 的 baseURL 若不含 /v1 前缀，SDK 会发到 /messages 而非 /v1/messages）
+      const messagesMatch = /^\/(?:v1\/)?messages(\/count_tokens)?\/?$/.exec(url.split('?')[0] ?? '')
       if (req.method === 'POST' && messagesMatch !== null) {
         const ct = typeof req.headers['content-type'] === 'string' ? req.headers['content-type'].toLowerCase() : ''
         if (!ct.startsWith('application/json')) {
