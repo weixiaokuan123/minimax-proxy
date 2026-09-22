@@ -1,30 +1,37 @@
-﻿# 启动 minimax-proxy（后台隐藏窗口），写入 pid 与日志。重复启动会被忽略。
-param(
-  [switch]$Foreground
-)
+# minimax-proxy launcher.
+# Starts the proxy detached (via WScript.Shell COM) so the caller never waits on
+# the long-lived node process. Idempotent: skips if the ports are already open.
+param([switch]$Foreground)
 
 $ErrorActionPreference = 'Stop'
-$Root = Split-Path -Parent $PSScriptRoot
+$Root    = Split-Path -Parent $PSScriptRoot
 $PidFile = Join-Path $Root 'logs\proxy.pid'
 $OutLog  = Join-Path $Root 'logs\proxy.out.log'
 $ErrLog  = Join-Path $Root 'logs\proxy.err.log'
+$Ports   = @(39305, 39306)
 
-function Test-Running([int]$procId) {
-  if ($procId -le 0) { return $false }
+function Test-Port([int]$Port) {
   try {
-    $p = Get-Process -Id $procId -ErrorAction Stop
-    $cli = (Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction SilentlyContinue).CommandLine
-    return ($null -ne $p -and $cli -and $cli -like '*minimax-proxy*serve.ts*')
+    $t = New-Object System.Net.Sockets.TcpClient
+    $t.Connect('127.0.0.1', $Port)
+    $t.Close()
+    return $true
   } catch { return $false }
 }
 
-if (Test-Path $PidFile) {
-  $oldId = [int]((Get-Content $PidFile -Raw).Trim())
-  if (Test-Running $oldId) {
-    Write-Host "minimax-proxy 已在运行 (PID $oldId)"
-    exit 0
+function All-PortsUp([int[]]$List) {
+  foreach ($p in $List) { if (-not (Test-Port $p)) { return $false } }
+  return $true
+}
+
+function Owner-PidOf([int]$Port) {
+  foreach ($ln in (netstat -ano)) {
+    if ($ln -match 'LISTENING' -and $ln -match ":$Port\s") {
+      $f = ($ln -split '\s+') | Where-Object { $_ -ne '' }
+      if ($f.Count -ge 4) { return [int]$f[-1] }
+    }
   }
-  Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
+  return 0
 }
 
 if ($Foreground) {
@@ -32,23 +39,30 @@ if ($Foreground) {
   exit $LASTEXITCODE
 }
 
-$proc = Start-Process -FilePath 'node' `
-  -ArgumentList @((Join-Path $Root 'src\serve.ts')) `
-  -WorkingDirectory $Root `
-  -WindowStyle Hidden `
-  -RedirectStandardOutput $OutLog `
-  -RedirectStandardError $ErrLog `
-  -PassThru
+if (All-PortsUp $Ports) {
+  Write-Host "minimax-proxy already running (ports $($Ports -join ','))"
+  exit 0
+}
 
-Set-Content -Path $PidFile -Value $proc.Id -Encoding ASCII
-Start-Sleep -Seconds 2
+$serve = Join-Path $Root 'src\serve.ts'
+$cmd = 'cmd /c node "' + $serve + '" > "' + $OutLog + '" 2> "' + $ErrLog + '"'
+$sh = New-Object -ComObject WScript.Shell
+$sh.Run($cmd, 0, $false) | Out-Null
 
-if (Test-Running $proc.Id) {
-  Write-Host "minimax-proxy 已后台启动 (PID $($proc.Id))"
-  Write-Host "  cn(国内) http://127.0.0.1:39305"
-  Write-Host "  en(国际) http://127.0.0.1:39306"
+$deadline = (Get-Date).AddSeconds(12)
+while ((Get-Date) -lt $deadline) {
+  if (All-PortsUp $Ports) { break }
+  Start-Sleep -Milliseconds 400
+}
+
+if (All-PortsUp $Ports) {
+  $procId = Owner-PidOf $Ports[0]
+  if ($procId -gt 0) { Set-Content -Path $PidFile -Value $procId -Encoding ASCII }
+  Write-Host "minimax-proxy started (PID $procId)"
+  Write-Host "  cn http://127.0.0.1:39305"
+  Write-Host "  en http://127.0.0.1:39306"
 } else {
-  Write-Host "启动失败，请查看日志：$ErrLog"
+  Write-Host "minimax-proxy failed to start; check $ErrLog"
   Get-Content $ErrLog -ErrorAction SilentlyContinue
   exit 1
 }
