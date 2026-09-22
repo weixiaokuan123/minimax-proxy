@@ -3,4 +3,4 @@
  * 供自动更新检测比对。发布时手动递增。
  *   - 自动随机签到、守护式拉起桌面端等为本版新增功能。
  */
-export const MINIMAX_CONNECT_VERSION = '1.1.0'
+export const MINIMAX_CONNECT_VERSION = '1.2.0'
