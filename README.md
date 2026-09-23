@@ -38,6 +38,19 @@ MiniMax 的 `refresh_token` 是**一次性轮换**的，且与桌面端共享。
 > 只对「有凭据但已过期」（`expired`）生效。若该区域**从未登录**（`signed-out`），
 > 拉起桌面端也救不回来（桌面端只续当前登录区），此时如实报错，不会反复弹窗。
 
+### 拉起后自动最小化，不挡桌面
+
+桌面端自己写死了「启动即 `show()` + `focus()`」（`createArchonChatWindow` 里
+`window.once('ready-to-show', () => { window.show(); window.focus() })`），
+代理改不了它启动时的形态，只能在它起来后把窗口收到任务栏：
+
+- **只对代理拉起的实例**收起窗口；你手动打开的实例不动（方便正常用界面）
+- 与等 token 写盘**并行**执行，不拖慢续期
+- 日志会打印 `桌面端窗口已最小化到任务栏`
+
+- 关闭：`MINIMAX_MINIMIZE_ON_LAUNCH=off`
+- 等待窗口出现的上限：`MINIMAX_MINIMIZE_WAIT_MS=30000`
+
 ## 空闲自动退出
 
 代理拉起的桌面端，**闲置 20 分钟后自动关闭**，避免它一直挂在后台。
@@ -108,6 +121,13 @@ macOS / Linux：`node src/serve.ts` 前台运行，`node scripts/inject-config.c
 | `MINIMAX_CN_PORT` / `MINIMAX_EN_PORT` | `39305` / `39306` | 端点端口 |
 | `MINIMAX_SIGNIN` | `on` | 设为 `off` 关闭自动签到 |
 | `MINIMAX_SIGNIN_START_HOUR` / `END_HOUR` | `7` / `10` | 随机窗口 |
+| `MINIMAX_AUTO_LAUNCH` | `on` | 设为 `off` 关闭「token 过期自动拉起桌面端」 |
+| `MINIMAX_MINIMIZE_ON_LAUNCH` | `on` | 设为 `off` 则拉起后不收窗口 |
+| `MINIMAX_MINIMIZE_WAIT_MS` | `30000` | 等待窗口出现并最小化的上限 |
+| `MINIMAX_IDLE_EXIT_MS` | `1200000` | 空闲多久退出代理拉起的桌面端；`0` 关闭 |
+| `MINIMAX_IDLE_TICK_MS` | `30000` | 空闲检查间隔 |
+| `MINIMAX_LAUNCH_WAIT_MS` | `120000` | 等待桌面端续期的上限 |
+| `MINIMAX_QUIT_WAIT_MS` | `30000` | 等待桌面端退出的上限 |
 
 ## 安全模型
 

@@ -263,12 +263,25 @@ export function createMiniMaxShim(options: MiniMaxShimOptions): MiniMaxShim {
 
         const controller = new AbortController()
         const abort = (): void => controller.abort()
+        // 监听器必须用完即摘：HTTP keep-alive 下 socket 会被复用，
+        // 若每次请求都挂 close/aborted 而不移除，会累积成
+        // MaxListenersExceededWarning；更糟的是上一个请求遗留的 abort()
+        // 会在本请求进行中触发，把在途流失效，导致「headers 已发送后又写头」。
+        const cleanup = (): void => {
+          req.off('aborted', abort)
+          req.socket.off('close', abort)
+          res.off('close', cleanup)
+          res.off('finish', cleanup)
+        }
         req.once('aborted', abort)
         req.socket.once('close', abort)
+        res.once('close', cleanup)
+        res.once('finish', cleanup)
 
         const subPath = messagesMatch[1] !== undefined ? '/messages/count_tokens' : '/messages'
         const result = await options.client.send(cred, subPath, raw, req.headers, controller.signal)
         if (!result.ok || !result.response) {
+          cleanup()
           const code = result.kind ? STATUS_BY_KIND[result.kind] : 502
           return writeError(res, code, 'api_error', result.message ?? 'upstream error')
         }
@@ -288,6 +301,7 @@ export function createMiniMaxShim(options: MiniMaxShimOptions): MiniMaxShim {
           options.logger?.warn(`minimax(${region}): upstream stream failed`, error)
           if (!res.writableEnded) res.end()
         })
+        body.on('end', cleanup)
         body.pipe(res)
         return
       }

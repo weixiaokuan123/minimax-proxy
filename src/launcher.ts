@@ -171,9 +171,59 @@ async function aliveCount(): Promise<number> {
   })
 }
 
+/**
+ * 把桌面端主窗口最小化（不影响它继续在后台跑、继续续期 token）。
+ *
+ * 背景：桌面端自己写死了「启动即 show()+focus()」（`createArchonChatWindow` 里
+ * `window.once('ready-to-show', () => { window.show(); window.focus() })`），
+ * 代理无法改变它启动时的形态，只能在它起来后把窗口收起来，
+ * 免得续期时突然弹一个 1400×900 的大窗口盖住你的桌面。
+ *
+ * 只作用于**有主窗口**的进程；进程还在但窗口未创建时静默跳过
+ * （调用方可稍后重试）。返回是否成功找到并最小化了窗口。
+ */
+export async function minimizeDesktopWindow(): Promise<boolean> {
+  if (process.platform !== 'win32') return false
+  return await new Promise<boolean>((resolve) => {
+    // 用 PowerShell + user32 的 ShowWindow(SW_MINIMIZE=6)。
+    // 优先挑 MainWindowHandle 非 0 的进程（Electron 主窗口所在进程）。
+    const script = [
+      "Add-Type -Namespace Mm -Name Win -MemberDefinition '[DllImport(\"user32.dll\")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);' -ErrorAction SilentlyContinue",
+      "$w = Get-Process 'MiniMax Code' -ErrorAction SilentlyContinue | Where-Object { -not $_.HasExited -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1",
+      "if ($w) { [Mm.Win]::ShowWindow($w.MainWindowHandle, 6) | Out-Null; 'OK' } else { 'NOWIN' }",
+    ].join('; ')
+    const child = spawn('powershell', ['-NoProfile', '-Command', script], { windowsHide: true })
+    let out = ''
+    child.stdout.on('data', d => { out += String(d) })
+    child.on('error', () => resolve(false))
+    child.on('close', () => resolve(out.includes('OK')))
+  })
+}
+
+/**
+ * 反复尝试最小化，直到成功或超时。
+ *
+ * 桌面端启动后要过几秒才创建出主窗口，过早调用会拿到「无窗口」，
+ * 因此需要轮询；一旦最小化成功就停止（避免把用户后来点开的窗口又收起来）。
+ *
+ * @param timeoutMs 最长等待；默认 30 秒
+ * @param intervalMs 轮询间隔；默认 1500 毫秒
+ */
+export async function minimizeDesktopWindowWhenReady(
+  options: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<boolean> {
+  const timeoutMs = options.timeoutMs ?? 30_000
+  const intervalMs = options.intervalMs ?? 1500
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await minimizeDesktopWindow()) return true
+    await new Promise(r => setTimeout(r, intervalMs))
+  }
+  return false
+}
+
 /** 启动桌面端，返回子进程引用与「是否由我们启动」。 */
-export async function launchDesktop(): Promise<LaunchResult> {
-  const running = await isRunning()
+export async function launchDesktop(): Promise<LaunchResult> {  const running = await isRunning()
   if (running) {
     return { startedByUs: false, wasAlreadyRunning: true }
   }

@@ -18,7 +18,7 @@ import { createMiniMaxShim, type MiniMaxShim, type ShimLogger } from './shim.ts'
 import { MiniMaxUpstreamClient } from './upstream.ts'
 import { MiniMaxSigninClient } from './signin.ts'
 import { SigninScheduler, formatSec } from './scheduler.ts'
-import { isRunning, launchDesktop, terminateDesktop, waitForTokenReady } from './launcher.ts'
+import { isRunning, launchDesktop, minimizeDesktopWindowWhenReady, terminateDesktop, waitForTokenReady } from './launcher.ts'
 import { DesktopSession } from './session.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -42,6 +42,14 @@ const QUIT_WAIT_MS = Number(process.env['MINIMAX_QUIT_WAIT_MS'] ?? 30_000)
 const IDLE_EXIT_MS = Number(process.env['MINIMAX_IDLE_EXIT_MS'] ?? 20 * 60 * 1000)
 /** 空闲检查间隔。 */
 const IDLE_TICK_MS = Number(process.env['MINIMAX_IDLE_TICK_MS'] ?? 30_000)
+/**
+ * 代理拉起桌面端后，是否顺手把它的窗口最小化到任务栏。
+ * 桌面端写死了「启动即 show()+focus()」，只在代理拉起的实例上收窗口，
+ * 用户手动打开的实例不动（方便正常使用界面）。
+ */
+const MINIMIZE_ON_LAUNCH = (process.env['MINIMAX_MINIMIZE_ON_LAUNCH'] ?? 'on') !== 'off'
+/** 等待桌面端窗口出现并最小化的最长时间。 */
+const MINIMIZE_WAIT_MS = Number(process.env['MINIMAX_MINIMIZE_WAIT_MS'] ?? 30_000)
 
 const REGION_PORTS: Record<MiniMaxRegion, number> = {
   cn: Number(process.env['MINIMAX_CN_PORT'] ?? 39305),
@@ -107,6 +115,14 @@ async function renewTokenIfNeeded(region: MiniMaxRegion): Promise<'already' | 'r
   if (launch.startedByUs) {
     desktopSession.markStarted()
     logger.info(`minimax(${region}): 已拉起桌面端续期，等待其写盘……`)
+    // 桌面端自己会 show()+focus() 弹一个大窗口；代理随手把它收到任务栏，
+    // 免得续期过程突然盖住你的桌面。不阻塞主流程（与等 token 并行）。
+    if (MINIMIZE_ON_LAUNCH) {
+      void minimizeDesktopWindowWhenReady({ timeoutMs: MINIMIZE_WAIT_MS }).then(ok => {
+        if (ok) logger.info('minimax: 桌面端窗口已最小化到任务栏')
+        else logger.warn('minimax: 未能最小化桌面端窗口（窗口可能未创建，不影响续期）')
+      }).catch(() => { /* 最小化失败不影响续期 */ })
+    }
   } else {
     logger.info(`minimax(${region}): 桌面端已在运行，等待其续期……`)
   }
