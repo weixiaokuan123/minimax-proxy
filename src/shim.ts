@@ -44,6 +44,14 @@ export interface MiniMaxShimOptions {
   signinStatus?: () => Promise<unknown>
   /** 立即检查/领取今日签到（幂等） */
   signinClaim?: () => Promise<unknown>
+  /**
+   * token 过期时的补救钩子：由宿主拉起桌面端并等待其续期写盘。
+   * 返回后 shim 会重试一次 resolve()；仍失败则按原样报 401。
+   * 不提供则退化为「过期直接报错」。
+   */
+  ensureToken?: () => Promise<void>
+  /** 每次请求进来时调用（用于空闲续命）。 */
+  onActivity?: () => void
 }
 
 const BODY_LIMIT = 64 * 1024 * 1024
@@ -228,16 +236,29 @@ export function createMiniMaxShim(options: MiniMaxShimOptions): MiniMaxShim {
           return writeError(res, 404, 'not_found_error', `Unknown model: ${parsed.model}`)
         }
 
+        options.onActivity?.()
+
         let cred
         try {
           cred = await options.store.resolve()
         } catch (error) {
-          if (error instanceof MiniMaxAuthError) {
+          if (error instanceof MiniMaxAuthError && error.kind === 'expired' && options.ensureToken !== undefined) {
+            // token 过期：请求宿主拉起桌面端续期（通常 15~25s），成功后重试一次
+            try {
+              await options.ensureToken()
+              cred = await options.store.resolve()
+              options.onActivity?.()
+            } catch (retryError) {
+              const message = retryError instanceof Error ? retryError.message : String(retryError)
+              return writeError(res, 503, 'unavailable_error', `token 已过期，自动续期失败：${message}`)
+            }
+          } else if (error instanceof MiniMaxAuthError) {
             const code = error.kind === 'expired' ? 401 : 503
             const type = error.kind === 'expired' ? 'authentication_error' : 'unavailable_error'
             return writeError(res, code, type, error.message)
+          } else {
+            throw error
           }
-          throw error
         }
 
         const controller = new AbortController()

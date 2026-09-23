@@ -15,11 +15,42 @@ MiniMax 的 `refresh_token` 是**一次性轮换**的，且与桌面端共享。
 
 因此本代理：
 
-- **只读** `accessToken`，绝不使用 `refreshToken`、绝不发起刷新、绝不写文件；
-- access token（约 1 小时）由 **MiniMax Code 桌面端自行续期**，代理每次请求实时重读；
-- token 过期/未登录时返回 401/503 提示「打开桌面端」，而不是自行刷新。
+- **只读** `accessToken`，绝不使用 `refreshToken`、绝不发起刷新、绝不写 auth 文件；
+- access token（约 1 小时）由 **MiniMax Code 桌面端自行续期**，代理每次请求实时重读。
 
-> 代价：桌面端必须保持登录/运行；关掉桌面端后 token 到期即失效（面板会显示 token 已过期）。
+> 一手的协议分析（端点、`client_id` 公开常量、轮换机制、桌面端那套跨进程锁）见
+> [`docs/minimax-token-research.md`](docs/minimax-token-research.md)。
+
+## token 过期自动续期（无需手动开桌面端）
+
+既然续期只能由桌面端做，代理就在**需要时把它叫起来**——你不需要再手动开：
+
+1. 请求进来 → 发现 token 已过期（`expired`）
+2. 代理**自动拉起 MiniMax Code 桌面端**（进程已在运行则直接复用）
+3. 轮询等待它写回新 token（实测约 10~25 秒）
+4. 用新 token 继续完成**本次请求**（你不会收到 401）
+
+页面/客户端只会感觉**这一次请求慢了一点**，之后恢复正常。
+
+- 关闭：`MINIMAX_AUTO_LAUNCH=off`（关闭后退化为「过期即报错」）
+- 等待上限：`MINIMAX_LAUNCH_WAIT_MS=120000`
+
+> 只对「有凭据但已过期」（`expired`）生效。若该区域**从未登录**（`signed-out`），
+> 拉起桌面端也救不回来（桌面端只续当前登录区），此时如实报错，不会反复弹窗。
+
+## 空闲自动退出
+
+代理拉起的桌面端，**闲置 20 分钟后自动关闭**，避免它一直挂在后台。
+
+| 规则 | 说明 |
+| --- | --- |
+| **只关自己拉起的** | 你手动打开的桌面端**永不触碰**（ownership 标记） |
+| **以代理请求计时** | 只要还有请求进来就不断续命，长时间使用不会被打断 |
+| **重启不失忆** | ownership 落盘到 `state/desktop-ownership.json`，代理重启/开机自启后仍会接管 |
+| **退出前二次确认** | 判定与真正杀进程之间若刚好来了请求，会取消退出 |
+
+- 调整空闲时长：`MINIMAX_IDLE_EXIT_MS=1200000`（毫秒；`0` 表示关闭自动退出）
+- 检查间隔：`MINIMAX_IDLE_TICK_MS=30000`
 
 ## 每日自动签到
 
@@ -33,6 +64,12 @@ MiniMax 的 `refresh_token` 是**一次性轮换**的，且与桌面端共享。
 
 - Node.js **22.19+ 或 24+**（TypeScript 由 Node 原生类型擦除直接运行，**无需构建、无需 npm install**）
 - 本机已安装并登录 **MiniMax Code** 桌面端（代理只读其登录态，不修改、不上传）
+
+运行测试（不联网、不触碰真实进程）：
+
+```powershell
+node --test test/session.test.ts
+```
 
 登录态路径（`src/auth.ts`）：
 

@@ -18,7 +18,8 @@ import { createMiniMaxShim, type MiniMaxShim, type ShimLogger } from './shim.ts'
 import { MiniMaxUpstreamClient } from './upstream.ts'
 import { MiniMaxSigninClient } from './signin.ts'
 import { SigninScheduler, formatSec } from './scheduler.ts'
-import { launchDesktop, terminateDesktop, waitForTokenReady } from './launcher.ts'
+import { isRunning, launchDesktop, terminateDesktop, waitForTokenReady } from './launcher.ts'
+import { DesktopSession } from './session.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
@@ -37,6 +38,10 @@ const AUTO_LAUNCH = (process.env['MINIMAX_AUTO_LAUNCH'] ?? 'on') !== 'off'
 const LAUNCH_WAIT_MS = Number(process.env['MINIMAX_LAUNCH_WAIT_MS'] ?? 120_000)
 /** 签到后等待桌面端进程树真正退出的最长时间。 */
 const QUIT_WAIT_MS = Number(process.env['MINIMAX_QUIT_WAIT_MS'] ?? 30_000)
+/** 代理拉起的桌面端空闲多久后自动退出（默认 20 分钟；0 表示不自动退出）。 */
+const IDLE_EXIT_MS = Number(process.env['MINIMAX_IDLE_EXIT_MS'] ?? 20 * 60 * 1000)
+/** 空闲检查间隔。 */
+const IDLE_TICK_MS = Number(process.env['MINIMAX_IDLE_TICK_MS'] ?? 30_000)
 
 const REGION_PORTS: Record<MiniMaxRegion, number> = {
   cn: Number(process.env['MINIMAX_CN_PORT'] ?? 39305),
@@ -74,6 +79,54 @@ interface RegionRuntime {
 }
 
 const runtimes = new Map<MiniMaxRegion, RegionRuntime>()
+
+/**
+ * 桌面端只有一个（用户在哪个区域登录，它续的就是哪个区域的 token），
+ * 因此归属与空闲状态是**全局共享**的，不按 region 分开。
+ */
+const desktopSession = new DesktopSession({
+  idleMs: IDLE_EXIT_MS > 0 ? IDLE_EXIT_MS : Number.MAX_SAFE_INTEGER,
+  stateFile: join(STATE_DIR, 'desktop-ownership.json'),
+  log: m => logger.info(m),
+  terminate: () => terminateDesktop({ timeoutMs: QUIT_WAIT_MS }),
+})
+
+/**
+ * 确保该区域 token 可用：过期时拉起桌面端、等其续期写盘。
+ * 供请求路径（shim.ensureToken）与签到路径共用。
+ *
+ * @returns 'already'（未过期，无需动作）| 'renewed'（本次拉起并成功续期）
+ */
+async function renewTokenIfNeeded(region: MiniMaxRegion): Promise<'already' | 'renewed'> {
+  const rt = runtimes.get(region)
+  if (rt === undefined) throw new Error(`minimax(${region}): 运行时未初始化`)
+  if (!AUTO_LAUNCH) throw new Error('token 已过期且未开启自动拉起（MINIMAX_AUTO_LAUNCH=off）')
+
+  const launch = await launchDesktop()
+  if (launch.error) throw new Error(launch.error)
+  if (launch.startedByUs) {
+    desktopSession.markStarted()
+    logger.info(`minimax(${region}): 已拉起桌面端续期，等待其写盘……`)
+  } else {
+    logger.info(`minimax(${region}): 桌面端已在运行，等待其续期……`)
+  }
+
+  const ready = await waitForTokenReady({
+    timeoutMs: LAUNCH_WAIT_MS,
+    check: async () => {
+      try { await rt.store.resolve(); return true } catch { return false }
+    },
+  })
+  if (!ready) {
+    // 拉起后仍拿不到 token（多半该区域未登录）：若桌面端是本会话拉起的，收掉它
+    if (launch.startedByUs) {
+      await terminateDesktop({ timeoutMs: QUIT_WAIT_MS }).catch(() => {})
+      desktopSession.markStopped()
+    }
+    throw new Error('桌面端启动后未能在限定时间内续期 token（该区域可能未登录）')
+  }
+  return 'renewed'
+}
 
 async function buildRegion(region: MiniMaxRegion): Promise<MiniMaxShim> {
   const store = new LiveMiniMaxStore(region)
@@ -125,6 +178,12 @@ async function buildRegion(region: MiniMaxRegion): Promise<MiniMaxShim> {
       const outcome = await scheduler.runNow(region, () => ensureSigned(rt, true))
       return { region, ...outcome }
     },
+    // 请求路径：token 过期时自动拉起桌面端续期（续期后桌面端留着，由空闲计时器决定何时退出）
+    ensureToken: async () => {
+      await renewTokenIfNeeded(region)
+    },
+    // 每次请求进来续命，避免空闲计时器误退正在使用的桌面端
+    onActivity: () => { desktopSession.touch() },
   })
   return shim
 }
@@ -192,41 +251,27 @@ async function ensureSigned(
     }
     logger.warn(`minimax(${rt.region}): token 已过期，拉起桌面端续期……`)
 
-    // 拉起前先确认桌面端没在运行（在运行却仍 expired 的情况交给用户，不重复拉）
-    const launch = await launchDesktop()
-    if (launch.error) throw new Error(launch.error)
-    if (launch.wasAlreadyRunning) {
-      // 桌面端已在运行但此区 token 仍不可用：通常=它登录的是另一区域，
-      // 等待一次续期；仍失败则当天冷却，不反复尝试。
-      logger.warn(`minimax(${rt.region}): 桌面端已在运行，等待其续期……`)
-    }
-
-    // 等桌面端自动续期写盘（store.resolve 成功即就绪）
-    const ready = await waitForTokenReady({
-      timeoutMs: LAUNCH_WAIT_MS,
-      check: async () => {
-        try { await rt.store.resolve(); return true } catch { return false }
-      },
-    })
-    if (!ready) {
-      if (launch.startedByUs) await terminateDesktop().catch(() => {})
-      // 该区域拉起后仍无 token（多半是未登录此区域）：今天不再自动拉起，避免反复弹窗
+    try {
+      await renewTokenIfNeeded(rt.region)
+    } catch (error) {
+      // 拉起后仍无凭据：今天不再自动拉起，避免反复弹窗
       if (!manual) launchCooldown.set(rt.region, new Date().toISOString().slice(0, 10))
-      throw new Error('桌面端启动后未能在限定时间内续期 token（该区域可能未登录）')
+      throw error
     }
 
-    // 续期成功后执行签到。无论签到成功还是抛错，只要桌面端是代理本次拉起的，
-    // 都必须在 finally 里退出——避免签到失败导致桌面端残留运行。
+    // 续期成功后执行签到。签到是**一次性**任务，用完即还：
+    // 若桌面端是代理本次拉起的，签完立刻退出（区别于请求驱动的续期——那需要留着给请求用）。
     try {
       const cred = await rt.store.resolve()
       const outcome = await rt.signin.claim(cred)
       return outcome
     } finally {
-      if (launch.startedByUs) {
+      if (desktopSession.owned) {
         // 给签到请求一点收尾时间，再退出并等待进程真正结束
         await new Promise(r => setTimeout(r, 1500))
         await terminateDesktop({ timeoutMs: QUIT_WAIT_MS }).catch(e =>
           logger.warn('退出桌面端失败：', String(e)))
+        desktopSession.markStopped()
         logger.info(`minimax(${rt.region}): 签到流程结束，已退出由代理拉起的桌面端`)
       }
     }
@@ -247,12 +292,34 @@ async function main(): Promise<void> {
 
   logger.info(`minimax-proxy 就绪：国内 ${REGION_PORTS.cn} / 国际 ${REGION_PORTS.en}`)
 
+  // 接管上次由代理拉起的桌面端（若仍在运行）：
+  // 否则代理重启即失忆，桌面端会永久残留 —— 正是「必须一直开着」的另一面。
+  if (IDLE_EXIT_MS > 0) {
+    const desktopRunning = await isRunning()
+    const adopted = await desktopSession.restore(desktopRunning)
+    if (adopted) {
+      logger.info('minimax: 继续沿用空闲退出策略管理该桌面端')
+    } else if (desktopRunning) {
+      logger.info('minimax: 检测到桌面端在运行，但非代理拉起，不予接管（不会自动关闭它）')
+    }
+  }
+
+  // 空闲退出：只针对「代理拉起的」桌面端；用户手动开的实例永不触碰。
+  // 只要还有请求进来就会续命，因此长时间使用不会被打断。
+  if (IDLE_EXIT_MS > 0) {
+    const idleTimer = setInterval(() => { void desktopSession.tick() }, IDLE_TICK_MS)
+    idleTimer.unref()
+    logger.info(`空闲退出已启用：代理拉起的桌面端闲置 ${Math.round(IDLE_EXIT_MS / 60_000)} 分钟后自动关闭`)
+  } else {
+    logger.info('空闲退出已关闭（MINIMAX_IDLE_EXIT_MS=0）')
+  }
+
   if (SIGNIN_ENABLED) {
     setTimeout(() => { void signinTick() }, SIGNIN_INITIAL_DELAY_MS).unref()
     const timer = setInterval(() => { void signinTick() }, SIGNIN_TICK_MS)
     timer.unref()
     logger.info(`每日签到已启用：本地 ${SIGNIN_START_HOUR}:00–${SIGNIN_END_HOUR}:00 随机时刻自动领取` +
-      (AUTO_LAUNCH ? '；token 过期时自动拉起桌面端、签完退出' : '；自动拉起桌面端已关闭'))
+      (AUTO_LAUNCH ? '；token 过期时自动拉起桌面端续期' : '；自动拉起桌面端已关闭'))
   } else {
     logger.info('每日签到已关闭（MINIMAX_SIGNIN=off）')
   }

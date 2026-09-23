@@ -38,6 +38,14 @@ function standardInstallDirs(): string[] {
     join(programFilesX86, 'MiniMax Code'),
     join(programFiles, 'MiniMaxCode', 'MiniMax Code'),
   ]
+  // 非系统盘安装很常见（如 D:\Software\MiniMaxCode\MiniMax Code）：
+  // 逐个探测常见盘符，命中即用。existsSync 很廉价，比走注册表快得多。
+  for (const drive of ['C:', 'D:', 'E:', 'F:']) {
+    dirs.push(join(`${drive}\\`, 'Software', 'MiniMaxCode', 'MiniMax Code'))
+    dirs.push(join(`${drive}\\`, 'MiniMaxCode', 'MiniMax Code'))
+    dirs.push(join(`${drive}\\`, 'Program Files', 'MiniMax Code'))
+    dirs.push(join(`${drive}\\`, 'Programs', 'MiniMax Code'))
+  }
   return dirs
 }
 
