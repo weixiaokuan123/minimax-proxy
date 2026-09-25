@@ -188,8 +188,10 @@ export function createMiniMaxShim(options: MiniMaxShimOptions): MiniMaxShim {
       // 只解析一次路径：signin 与 messages 路由都要用，避免重复 split
       const path = url.split('?')[0] ?? '/'
 
+      // 每个分支都必须 return：漏掉就会继续往下走，最终落到 404 分支写第二个响应头，
+      // 触发 ERR_HTTP_HEADERS_SENT（被 catch 吞掉，但每次请求都会白产一条错误日志）。
       if (req.method === 'GET' && (url === '/healthz' || url === '/healthz/')) {
-        writeJson(res, 200, { ok: true, region, version: MINIMAX_CONNECT_VERSION })
+        return writeJson(res, 200, { ok: true, region, version: MINIMAX_CONNECT_VERSION })
       }
       if (req.method === 'GET' && (url === '/status' || url === '/status/')) {
         return await status(req, res)
