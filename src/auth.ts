@@ -15,6 +15,8 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
+import { redactPaths } from './redact.ts'
+
 export type MiniMaxRegion = 'cn' | 'en'
 
 export interface RegionEndpoint {
@@ -173,7 +175,7 @@ export class LiveMiniMaxStore {
         userID: hint.userID,
         expiresAtMs: cred.expiresAtMs,
         remainingSec: Math.max(0, Math.round((cred.expiresAtMs - Date.now()) / 1000)),
-        filePath: cred.filePath,
+        filePath: redactPaths(cred.filePath),
       }
     } catch (error) {
       const kind = error instanceof MiniMaxAuthError ? error.kind : 'signed-out'
@@ -182,7 +184,7 @@ export class LiveMiniMaxStore {
         region: this.region,
         account: hint.account,
         userID: hint.userID,
-        filePath: authFileOf(this.region),
+        filePath: redactPaths(authFileOf(this.region)),
         message: error instanceof Error ? error.message : String(error),
       }
     }

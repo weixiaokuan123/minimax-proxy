@@ -1,6 +1,9 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
+/** touch() 写盘的最小间隔：请求级续命是内存行为，落盘只需保证重启不误判归属。 */
+const TOUCH_PERSIST_DEBOUNCE_MS = 30 * 1000
+
 /**
  * 桌面端会话管理：跟踪「代理拉起的桌面端」并按其空闲时长自动退出。
  *
@@ -54,6 +57,8 @@ export class DesktopSession {
   private startedByUs = false
   private lastActivityMs = 0
   private terminating = false
+  /** 上次 ownership 落盘时刻，用于对 touch() 的写盘做去抖。 */
+  private lastPersistMs = 0
   private readonly idleMs: number
   private readonly now: () => number
   private readonly terminate: () => Promise<number>
@@ -132,9 +137,20 @@ export class DesktopSession {
     void this.persist()
   }
 
-  /** 每次代理收到请求时调用，用于续命。 */
+  /**
+   * 每次代理收到请求时调用，用于续命。
+   *
+   * - 只有「桌面端确实由本代理拉起」时才需要落盘：startedByUs 为假时该记录本身
+   *   就没有意义，却会让**每个请求**都写一次盘；
+   * - 对写盘做 30s 去抖：lastActivityMs 仍是请求级精度（内存），
+   *   落盘只需要保证「重启后不误判归属」这一件事。
+   */
   touch(): void {
     this.lastActivityMs = this.now()
+    if (!this.startedByUs) return
+    const now = this.now()
+    if (now - this.lastPersistMs < TOUCH_PERSIST_DEBOUNCE_MS) return
+    this.lastPersistMs = now
     void this.persist()
   }
 
