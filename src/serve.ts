@@ -77,10 +77,50 @@ function fmtLogArgs(args: unknown[]): string {
   return redactPaths(text)
 }
 
+/** 日志重复抑制窗口：同一 level + 同一文本在该窗口内只输出一次。 */
+const LOG_DEDUP_WINDOW_MS = 60_000
+let lastLogKey = ''
+let lastLogAtMs = 0
+let suppressedLogCount = 0
+
+/**
+ * 连续重复日志抑制。
+ *
+ * 上游反复故障时（例如某区域长期未登录），同一条错误会被每个 tick 重记一次，
+ * 既刷屏又放大磁盘写入。这里对「同一 level + 同一文本」在窗口内只输出首次，
+ * 并在下一条不同日志之前补发一行计数，保证信息不丢。
+ */
+function shouldSuppressLog(key: string): { suppress: boolean; flushNote: string | null } {
+  const now = Date.now()
+  if (suppressedLogCount > 0 && (key !== lastLogKey || now - lastLogAtMs >= LOG_DEDUP_WINDOW_MS)) {
+    const note = `（同类日志已抑制 ${suppressedLogCount} 条）`
+    suppressedLogCount = 0
+    return { suppress: false, flushNote: note }
+  }
+  if (key === lastLogKey && now - lastLogAtMs < LOG_DEDUP_WINDOW_MS) {
+    suppressedLogCount++
+    lastLogAtMs = now
+    return { suppress: true, flushNote: null }
+  }
+  lastLogKey = key
+  lastLogAtMs = now
+  return { suppress: false, flushNote: null }
+}
+
+function emitLog(level: 'info' | 'warn' | 'error', args: unknown[]): void {
+  const text = fmtLogArgs(args)
+  const { suppress, flushNote } = shouldSuppressLog(`${level}:${text}`)
+  const at = ts()
+  const sink = level === 'info' ? process.stdout : process.stderr
+  if (flushNote !== null) sink.write(`[${at}] [${level}] ${flushNote}\n`)
+  if (suppress) return
+  sink.write(`[${at}] [${level}] ${text}\n`)
+}
+
 const logger: ShimLogger = {
-  info: (...args) => process.stdout.write(`[${ts()}] [info] ${fmtLogArgs(args)}\n`),
-  warn: (...args) => process.stderr.write(`[${ts()}] [warn] ${fmtLogArgs(args)}\n`),
-  error: (...args) => process.stderr.write(`[${ts()}] [error] ${fmtLogArgs(args)}\n`),
+  info: (...args) => emitLog('info', args),
+  warn: (...args) => emitLog('warn', args),
+  error: (...args) => emitLog('error', args),
 }
 
 async function loadOrCreateKey(file: string): Promise<string> {

@@ -51,7 +51,7 @@ function standardInstallDirs(): string[] {
 
 /** 候选可执行文件路径（按优先级）。 */
 export function candidateExePaths(): string[] {
-  const envExe = process.env['MINIMAZ_CODE_EXE'] ?? process.env['MINIMAX_CODE_EXE']
+  const envExe = process.env['MINIMAX_CODE_EXE']
   const exeName = 'MiniMax Code.exe'
   const candidates = [
     ...(envExe ? [envExe] : []),
@@ -95,8 +95,103 @@ function runReg(args: string[]): Promise<string> {
   })
 }
 
+/** 注册表输出的一个键块：键路径 + 值名→数据。 */
+interface RegKeyBlock {
+  path: string
+  values: Map<string, string>
+}
+
+/** DisplayName 是否指向 MiniMax Code（排除 Uninstaller 自身等）。 */
+function isMiniMaxDisplayName(name: string): boolean {
+  return /MiniMax\s+Code/i.test(name)
+}
+
+/** 去掉首尾引号并压缩空白。 */
+function unquote(raw: string): string {
+  return raw.trim().replace(/^"|"$/g, '')
+}
+
+/** InstallLocation 指向安装目录时的可执行文件路径。 */
+function exeFromInstallLocation(loc: string): string | undefined {
+  const dir = unquote(loc)
+  if (dir === '') return undefined
+  const candidate = join(dir, 'MiniMax Code.exe')
+  return existsSync(candidate) ? candidate : undefined
+}
+
+/** 从 UninstallString / DisplayIcon 的所在目录推断可执行文件路径。 */
+function exeFromInstallHint(raw0: string): string | undefined {
+  if (raw0 === '') return undefined
+  const raw = unquote(raw0).split(',')[0]!.replace(/\s+\/\S+\s*$/g, '').trim()
+  const candidate = join(raw.replace(/[\\/][^\\/]+$/, ''), 'MiniMax Code.exe')
+  return existsSync(candidate) ? candidate : undefined
+}
+
+/**
+ * 把 `reg query <root> /s` 的整段输出拆成键块。
+ *
+ * 为什么可以按行硬解析：键路径（HKEY…）与值类型名（REG_SZ / REG_EXPAND_SZ 等）
+ * 都由 reg.exe 直接输出，**不随系统显示语言本地化**，因此各语言版本格式一致。
+ *
+ * @returns 键块数组；若输出非空却解析不出任何键路径行，返回 null
+ *          （表示格式与预期不符，交由调用方回退到逐键查询）。
+ */
+function parseRegBlocks(out: string): RegKeyBlock[] | null {
+  const blocks: RegKeyBlock[] = []
+  let current: RegKeyBlock | undefined
+  let sawPathLine = false
+  for (const line of out.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (trimmed === '') continue
+    if (/^(HKEY|HK)/i.test(trimmed)) {
+      sawPathLine = true
+      current = { path: trimmed, values: new Map<string, string>() }
+      blocks.push(current)
+      continue
+    }
+    if (current === undefined) continue
+    // 形如 `    DisplayName    REG_SZ    MiniMax Code`（列间以空白分隔）
+    const m = /^\s*(.+?)\s+REG_[A-Z_]+\s*(.*)$/i.exec(line)
+    if (m !== null) current.values.set(m[1]!.trim(), m[2]!.trim())
+  }
+  if (!sawPathLine && out.trim() !== '') return null
+  return blocks
+}
+
+/** 从单个键块推断 MiniMax Code.exe 路径。 */
+function exeFromBlock(block: RegKeyBlock): string | undefined {
+  // InstallLocation 常为空：再从 UninstallString / DisplayIcon 所在目录推断
+  return exeFromInstallLocation(block.values.get('InstallLocation') ?? '')
+    ?? exeFromInstallHint(block.values.get('UninstallString') ?? '')
+    ?? exeFromInstallHint(block.values.get('DisplayIcon') ?? '')
+}
+
+/**
+ * 在某个 Uninstall 根下查找 MiniMax Code 的安装目录。
+ *
+ * 性能：改为**一次** `reg query <root> /s` 批量取出该根下所有子键的所有值，
+ * 再在内存里按 DisplayName 过滤；原实现对每个子键各 spawn 一次 reg
+ * （先列子键，再逐个查值），子键多时可达数百次进程启动。
+ *
+ * 正确性：批解析仅依赖不随语言变化的 HKEY 路径与 REG_* 类型名；
+ * 万一某系统输出格式异常（解析结果为空但输出非空），回退到原逐键查询，
+ * 宁可慢也不漏。
+ */
 async function queryUninstallRoot(root: string): Promise<string | undefined> {
-  // 列出所有子键（键名常是 GUID，不含产品名，不能按键名过滤）
+  const out = await runReg([root, '/s'])
+  const blocks = parseRegBlocks(out)
+  if (blocks === null) return await queryUninstallRootPerKey(root)
+  for (const block of blocks) {
+    const displayName = block.values.get('DisplayName')
+    if (displayName === undefined || !isMiniMaxDisplayName(displayName)) continue
+    const hit = exeFromBlock(block)
+    if (hit !== undefined) return hit
+  }
+  return undefined
+}
+
+/** 回退路径：逐个查询子键的 DisplayName 与安装线索（批解析失败时使用）。 */
+async function queryUninstallRootPerKey(root: string): Promise<string | undefined> {
   const list = await runReg([root])
   const subKeys = list.split(/\r?\n/)
     .map(l => l.trim())
@@ -104,30 +199,14 @@ async function queryUninstallRoot(root: string): Promise<string | undefined> {
     .filter(l => /^(HKEY|HK)/i.test(l) && l !== root)
   for (const key of subKeys) {
     // 先读 DisplayName 判断是不是 MiniMax Code（排除 Uninstaller 自身等）
-    const nameOut = await runReg([key, '/v', 'DisplayName'])
-    const nameMatch = /DisplayName\s+REG_SZ\s+(.+)/i.exec(nameOut)
-    if (!nameMatch || !/MiniMax\s+Code/i.test(nameMatch[1] ?? '')) continue
+    const displayName = await valueAt(key, 'DisplayName')
+    if (displayName === undefined || !isMiniMaxDisplayName(displayName)) continue
 
-    const details = await runReg([key, '/v', 'InstallLocation'])
-    const m = /InstallLocation\s+REG_SZ\s+(.+)/i.exec(details)
-    if (m) {
-      const loc = (m[1] ?? '').trim().replace(/^"|"$/g, '')
-      if (loc !== '') {
-        const candidate = join(loc, 'MiniMax Code.exe')
-        if (existsSync(candidate)) return candidate
-      }
-    }
-    // InstallLocation 常为空：从 UninstallString / DisplayIcon 所在目录推断
-    const probe = [
-      await valueAt(key, 'UninstallString'),
-      await valueAt(key, 'DisplayIcon'),
-    ]
-    for (const raw0 of probe) {
-      if (!raw0) continue
-      const raw = raw0.replace(/^"|"$/g, '').split(',')[0]!.replace(/\s+\/\S+\s*$/g, '').trim()
-      const dir = raw.replace(/[\\/][^\\/]+$/, '')
-      const candidate = join(dir, 'MiniMax Code.exe')
-      if (existsSync(candidate)) return candidate
+    const fromLocation = exeFromInstallLocation(await valueAt(key, 'InstallLocation') ?? '')
+    if (fromLocation !== undefined) return fromLocation
+    for (const value of ['UninstallString', 'DisplayIcon']) {
+      const hit = exeFromInstallHint(await valueAt(key, value) ?? '')
+      if (hit !== undefined) return hit
     }
   }
   return undefined
@@ -207,13 +286,13 @@ export async function minimizeDesktopWindow(): Promise<boolean> {
  * 因此需要轮询；一旦最小化成功就停止（避免把用户后来点开的窗口又收起来）。
  *
  * @param timeoutMs 最长等待；默认 30 秒
- * @param intervalMs 轮询间隔；默认 1500 毫秒
+ * @param intervalMs 轮询间隔；默认 3000 毫秒（探测成本高，放宽间隔；总超时窗口不变）
  */
 export async function minimizeDesktopWindowWhenReady(
   options: { timeoutMs?: number; intervalMs?: number } = {},
 ): Promise<boolean> {
   const timeoutMs = options.timeoutMs ?? 30_000
-  const intervalMs = options.intervalMs ?? 1500
+  const intervalMs = options.intervalMs ?? 3000
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (await minimizeDesktopWindow()) return true
@@ -223,7 +302,8 @@ export async function minimizeDesktopWindowWhenReady(
 }
 
 /** 启动桌面端，返回子进程引用与「是否由我们启动」。 */
-export async function launchDesktop(): Promise<LaunchResult> {  const running = await isRunning()
+export async function launchDesktop(): Promise<LaunchResult> {
+  const running = await isRunning()
   if (running) {
     return { startedByUs: false, wasAlreadyRunning: true }
   }
@@ -277,7 +357,8 @@ export async function terminateDesktop(options: { timeoutMs?: number } = {}): Pr
       })
       lastCount = n
     }
-    await new Promise(r => setTimeout(r, 1000))
+    // 探测成本高（每次都要 spawn powershell）：放宽到 5s，但总超时窗口仍为 30s
+    await new Promise(r => setTimeout(r, 5000))
   }
   return await aliveCount()
 }

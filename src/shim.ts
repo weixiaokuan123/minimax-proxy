@@ -5,6 +5,10 @@
  * body 上限、错误到 HTTP 状态码映射；新增对 `x-api-key` 的支持（@ai-sdk/anthropic 默认用它）。
  * 协议层为 Anthropic Messages 透传，不做格式转换。
  *
+ * 文案约定：本文件的**日志**一律中文；**对外 HTTP 错误体**的 message 一律英文
+ * （同一文件内不中英混排）。由上游或领域层抛出的动态消息（如 auth/upstream 的
+ * 中文报错）按原样透传，不在此文件内改写。
+ *
  * @module minimax-proxy/shim
  */
 
@@ -181,6 +185,8 @@ export function createMiniMaxShim(options: MiniMaxShimOptions): MiniMaxShim {
       if (!authed(req)) return writeError(res, 401, 'authentication_error', 'Missing or invalid API key')
 
       const url = req.url ?? '/'
+      // 只解析一次路径：signin 与 messages 路由都要用，避免重复 split
+      const path = url.split('?')[0] ?? '/'
 
       if (req.method === 'GET' && (url === '/healthz' || url === '/healthz/')) {
         writeJson(res, 200, { ok: true, region, version: MINIMAX_CONNECT_VERSION })
@@ -193,7 +199,7 @@ export function createMiniMaxShim(options: MiniMaxShimOptions): MiniMaxShim {
       }
 
       // ===== 每日签到 =====
-      if (url.split('?')[0] === '/signin/status') {
+      if (path === '/signin/status') {
         if (req.method === 'GET') {
           if (!options.signinStatus) return writeError(res, 404, 'not_found_error', 'sign-in not available')
           try {
@@ -203,7 +209,7 @@ export function createMiniMaxShim(options: MiniMaxShimOptions): MiniMaxShim {
           }
         }
       }
-      if (url.split('?')[0] === '/signin/claim') {
+      if (path === '/signin/claim') {
         if (req.method === 'POST') {
           if (!options.signinClaim) return writeError(res, 404, 'not_found_error', 'sign-in not available')
           try {
@@ -216,7 +222,7 @@ export function createMiniMaxShim(options: MiniMaxShimOptions): MiniMaxShim {
 
       // Anthropic Messages：兼容 /v1/messages 与 /messages（@ai-sdk/anthropic
       // 的 baseURL 若不含 /v1 前缀，SDK 会发到 /messages 而非 /v1/messages）
-      const messagesMatch = /^\/(?:v1\/)?messages(\/count_tokens)?\/?$/.exec(url.split('?')[0] ?? '')
+      const messagesMatch = /^\/(?:v1\/)?messages(\/count_tokens)?\/?$/.exec(path)
       if (req.method === 'POST' && messagesMatch !== null) {
         const ct = typeof req.headers['content-type'] === 'string' ? req.headers['content-type'].toLowerCase() : ''
         if (!ct.startsWith('application/json')) {
@@ -250,7 +256,7 @@ export function createMiniMaxShim(options: MiniMaxShimOptions): MiniMaxShim {
               options.onActivity?.()
             } catch (retryError) {
               const message = retryError instanceof Error ? retryError.message : String(retryError)
-              return writeError(res, 503, 'unavailable_error', `token 已过期，自动续期失败：${message}`)
+              return writeError(res, 503, 'unavailable_error', `token expired; automatic renewal failed: ${message}`)
             }
           } else if (error instanceof MiniMaxAuthError) {
             const code = error.kind === 'expired' ? 401 : 503
@@ -298,7 +304,7 @@ export function createMiniMaxShim(options: MiniMaxShimOptions): MiniMaxShim {
         res.writeHead(up.status, respHeaders)
         const body = Readable.fromWeb(up.body as Parameters<typeof Readable.fromWeb>[0])
         body.on('error', (error: unknown) => {
-          options.logger?.warn(`minimax(${region}): upstream stream failed`, error)
+          options.logger?.warn(`minimax(${region}): 上游流式响应失败`, error)
           if (!res.writableEnded) res.end()
         })
         body.on('end', cleanup)
@@ -308,7 +314,7 @@ export function createMiniMaxShim(options: MiniMaxShimOptions): MiniMaxShim {
 
       writeError(res, 404, 'not_found_error', `No such route: ${req.method} ${url}`)
     } catch (error) {
-      options.logger?.error(`minimax(${region}): shim request failed`, error)
+      options.logger?.error(`minimax(${region}): shim 请求处理失败`, error)
       if (!res.headersSent) writeError(res, 500, 'api_error', 'Internal shim error')
       else if (!res.writableEnded) res.end()
     }
