@@ -17,7 +17,8 @@ import { LiveMiniMaxStore, MiniMaxAuthError, type MiniMaxRegion } from './auth.t
 import { MiniMaxCatalog } from './catalog.ts'
 import { createMiniMaxShim, type MiniMaxShim, type ShimLogger } from './shim.ts'
 import { MiniMaxUpstreamClient } from './upstream.ts'
-import { MiniMaxSigninClient } from './signin.ts'
+import { MiniMaxSigninClient, localTimezone } from './signin.ts'
+import { CreditsCache, fetchMinimaxCredits } from './credits.ts'
 import { SigninScheduler, formatSec } from './scheduler.ts'
 import { isRunning, launchDesktop, minimizeDesktopWindowWhenReady, terminateDesktop, waitForTokenReady } from './launcher.ts'
 import { DesktopSession } from './session.ts'
@@ -275,6 +276,9 @@ async function buildRegion(region: MiniMaxRegion): Promise<MiniMaxShim> {
   const client = new MiniMaxUpstreamClient(region)
   const catalog = new MiniMaxCatalog(region)
   const signin = new MiniMaxSigninClient(region)
+  // 积分缓存：面板每 15 分钟刷一次，不缓存就是每轮都打一次上游。
+  const creditsCache = new CreditsCache(60_000)
+  const signinTz = localTimezone()
   // 签到状态按区域分文件：cn / en 各持一份，避免两个调度器各持内存副本
   // 整体回写同一文件时互相覆盖（丢更新）。
   const scheduler = new SigninScheduler({
@@ -298,6 +302,16 @@ async function buildRegion(region: MiniMaxRegion): Promise<MiniMaxShim> {
     client,
     catalog,
     logger,
+    credits: async () => {
+      const cred = await store.resolve()
+      const origin = signin.origin()
+      const r = await creditsCache.get(() => fetchMinimaxCredits(origin, cred.accessToken, signinTz))
+      return {
+        region,
+        ...r.credits,
+        cache: { cached: r.cached, ageSec: r.ageSec },
+      }
+    },
     signinStatus: async () => {
       const entry = await scheduler.entry(region) ?? await scheduler.plan(region)
       let panel: unknown = null

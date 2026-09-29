@@ -44,6 +44,13 @@ export interface MiniMaxShimOptions {
   client: MiniMaxUpstreamClient
   catalog: MiniMaxCatalog
   logger?: ShimLogger
+  /**
+   * 只读账户积分（余额 + 每笔额度的到期日）；不提供则 /credits 返回 404。
+   *
+   * 形状与 workbuddy 的积分包同构，agent-hub 面板因此能复用同一个
+   * `groupCreditPackages()`，不必为 MiniMax 再写一套聚合。
+   */
+  credits?: () => Promise<unknown>
   /** 只读签到面板（含今日计划）；不提供则 /signin/* 返回 404 */
   signinStatus?: () => Promise<unknown>
   /** 立即检查/领取今日签到（幂等） */
@@ -198,6 +205,18 @@ export function createMiniMaxShim(options: MiniMaxShimOptions): MiniMaxShim {
       }
       if (req.method === 'GET' && (url === '/v1/models' || url === '/v1/models/' || url === '/models' || url === '/models/')) {
         return listModels(res)
+      }
+
+      // ===== 账户积分（只读）=====
+      // 面板的积分区读它。字段与 workbuddy 的包同构，所以那边能复用同一套
+      // 「按到期日聚合」渲染，不必写第二套。
+      if (req.method === 'GET' && (url === '/credits' || url === '/credits/')) {
+        if (!options.credits) return writeError(res, 404, 'not_found', 'credits not available')
+        try {
+          return writeJson(res, 200, await options.credits())
+        } catch (error) {
+          return writeError(res, 502, 'credits_error', error instanceof Error ? error.message : String(error))
+        }
       }
 
       // ===== 每日签到 =====

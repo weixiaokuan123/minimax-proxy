@@ -9,6 +9,66 @@
 
 实测：非流式、SSE 流式、工具调用（`tool_use`）、签到状态与领取全部通过。
 
+## 导览
+
+> 这一节写给「懂技术、但没接触过这套东西」的人。读完这一节就能明白本项目在干什么、
+> 以及你最关心的那个功能（token 过期会自动帮你打开桌面端）在哪。
+> 下面原有的技术文档一字未改。
+
+### 为什么需要它
+
+MiniMax Code 桌面端只给你一个图形界面，**没有给命令行工具用的接口**；而且它的登录凭据是加密存在本地的。
+而 opencode 需要一个 HTTP API 才能调用模型。
+
+本项目做中间那一层：**读取桌面端的登录态 → 包装成标准 Anthropic Messages 接口 → 交给 opencode 用。**
+顺带把每天的签到积分领了。
+
+一句话：**让你已经付费登录的 MiniMax Code 账号，能在 opencode 里当 API 用。**
+
+它和另外两个平台代理（`workbuddy-proxy`、`trae-proxy`）是并列关系，各自独立、互不依赖。
+三者的状态汇总在一个网页面板里（`agent-hub`）。
+
+### 你最该知道的一件事
+
+**token 过期时，它会自己把 MiniMax Code 桌面端打开，等它续期，然后继续完成你这次的请求。**
+
+你不会收到 401，只会觉得「这一次稍微慢了一点」。这是本项目相对同类方案最省心的地方——
+不用你记得去开桌面端、也不用你手动重试。
+
+（下文「token 过期自动续期」一节讲这件事的实现细节。）
+
+### 端口
+
+| 区域 | 地址 |
+| --- | --- |
+| 国内版（cn） | `http://127.0.0.1:39305` |
+| 国际版（en） | `http://127.0.0.1:39306` |
+
+### 术语速查
+
+| 词 | 意思 |
+| --- | --- |
+| **回环 / loopback** | 只监听 `127.0.0.1`，只有本机能访问 |
+| **bearer key** | 首次启动随机生成的调用钥匙，防止本机其它程序误用你的账号 |
+| **透传** | 不改内容，原样转发。本项目上游本来就是 Anthropic 协议，所以无需转换 |
+| **幂等** | 同一操作做多次和做一次结果相同。签到已领就跳过 |
+| **只读凭据** | 本项目**只读**桌面端的登录文件，绝不写回。原因是 MiniMax 的 refresh token 是一次性轮换的，见下文红线 |
+| **ownership 标记** | 记录「这个桌面端是代理拉起的」，以便只关自己拉起的那个，不误关你手动打开的 |
+
+### 最短上手路径
+
+```powershell
+git clone https://github.com/weixiaokuan123/minimax-proxy.git "$env:USERPROFILE\.config\opencode\minimax-proxy"
+cd "$env:USERPROFILE\.config\opencode\minimax-proxy"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start.ps1   # 启动
+node .\scripts\inject-config.cjs                                          # 注入 provider
+```
+
+然后**重启 opencode**，在模型列表里选 `MiniMax 国内版(代理)` 下的 `MiniMax-M3`。
+前提是本机已安装并登录 MiniMax Code 桌面端。
+
+---
+
 ## ⚠️ 重要设计红线：只读，绝不刷新令牌
 
 MiniMax 的 `refresh_token` 是**一次性轮换**的，且与桌面端共享。若代理主动调用 `/oauth2/token` 刷新，会消耗磁盘上的 refresh_token 而不写回，**桌面端随后检测到失效会把登录态清空（强制登出）**。

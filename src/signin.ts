@@ -52,7 +52,13 @@ export interface ClaimOutcome {
   streak?: number
 }
 
-function localTimezone(): string {
+/** 从 messagesBaseUrl 取同源 origin（签到与积分接口都挂在同一个 host 下）。 */
+export function originOf(messagesBaseUrl: string): string {
+  return new URL(messagesBaseUrl).origin
+}
+
+/** 本机 IANA 时区。上游的签到与积分接口都要带 timezone_id 参数。 */
+export function localTimezone(): string {
   try {
     return Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai'
   } catch {
@@ -121,9 +127,9 @@ export class MiniMaxSigninClient {
     this.tz = tz ?? localTimezone()
   }
 
-  private origin(): string {
-    const u = new URL(this.endpoint.messagesBaseUrl)
-    return u.origin
+  /** 同源 origin。签到与积分接口都挂在它下面，公开出来供 serve 复用。 */
+  origin(): string {
+    return originOf(this.endpoint.messagesBaseUrl)
   }
 
   private headers(cred: MiniMaxCredential): Record<string, string> {
