@@ -5,4 +5,4 @@
  *
  * @module minimax-proxy/version
  */
-export const MINIMAX_CONNECT_VERSION = '1.4.5'
+export const MINIMAX_CONNECT_VERSION = '1.4.6'
